@@ -2,25 +2,35 @@ import functions_framework
 from flask import jsonify
 import vertexai
 from vertexai.generative_models import GenerativeModel, GenerationConfig
-import os # Best Practice: Import os to handle environment variables
+import os
 
 # --- Configuration (Loaded from environment variables) ---
-# This makes your code portable and secure.
 PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
 LOCATION = os.environ.get("GCP_LOCATION")
-MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-1.5-flash-001") # Provide a sensible default
+MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-1.5-flash-001")
 
-# --- Initialize Vertex AI ---
-# This check ensures the function won't start without its configuration.
-if not PROJECT_ID or not LOCATION:
-    raise EnvironmentError("GCP_PROJECT_ID and GCP_LOCATION environment variables must be set.")
-
-vertexai.init(project=PROJECT_ID, location=LOCATION)
-model = GenerativeModel(MODEL_NAME)
+# --- Global Client (Lazy Initialization) ---
+# Initialize the model as None. We will create it only on the first request.
+model = None
 
 @functions_framework.http
 def handle_request(request):
-    """ Handles incoming HTTP requests. """
+    """ Handles incoming HTTP requests with lazy initialization of the model. """
+    
+    global model  # Declare that we are using the global 'model' variable
+
+    # --- This is the key change ---
+    # If the model hasn't been initialized yet, do it now.
+    # This block will only run ONCE, during the very first request to the function.
+    if model is None:
+        print("Initializing Vertex AI model for the first time...")
+        if not PROJECT_ID or not LOCATION:
+            raise EnvironmentError("GCP_PROJECT_ID and GCP_LOCATION environment variables must be set.")
+        
+        vertexai.init(project=PROJECT_ID, location=LOCATION)
+        model = GenerativeModel(MODEL_NAME)
+        print("Model initialized successfully.")
+
     request_json = request.get_json(silent=True)
 
     if not request_json or 'prompt' not in request_json:
