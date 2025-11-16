@@ -1,59 +1,48 @@
 import functions_framework
 from flask import jsonify
-import vertexai
-from vertexai.generative_models import GenerativeModel, GenerationConfig
+from google.cloud import run_v2 # The new client library for Cloud Run
 import os
 
-# --- Configuration (Loaded from environment variables) ---
+# --- Configuration ---
 PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
 LOCATION = os.environ.get("GCP_LOCATION")
-MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-1.5-flash-001")
 
-# --- Global Client (Lazy Initialization) ---
-# Initialize the model as None. We will create it only on the first request.
-model = None
+# This agent is now single-purpose: it lists Cloud Run services.
+# In the future, we would add the Gemini model back in to *decide* which tool to run.
 
 @functions_framework.http
 def handle_request(request):
-    """ Handles incoming HTTP requests with lazy initialization of the model. """
     
-    global model  # Declare that we are using the global 'model' variable
-
-    # --- This is the key change ---
-    # If the model hasn't been initialized yet, do it now.
-    # This block will only run ONCE, during the very first request to the function.
-    if model is None:
-        print("Initializing Vertex AI model for the first time...")
-        if not PROJECT_ID or not LOCATION:
-            raise EnvironmentError("GCP_PROJECT_ID and GCP_LOCATION environment variables must be set.")
-        
-        vertexai.init(project=PROJECT_ID, location=LOCATION)
-        model = GenerativeModel(MODEL_NAME)
-        print("Model initialized successfully.")
-
-    request_json = request.get_json(silent=True)
-
-    if not request_json or 'prompt' not in request_json:
-        return jsonify({"error": "Invalid request. JSON payload with a 'prompt' key is required."}), 400
-
-    prompt = request_json['prompt']
-    print(f"Received prompt: {prompt}")
+    if not PROJECT_ID or not LOCATION:
+        raise EnvironmentError("GCP_PROJECT_ID and GCP_LOCATION environment variables must be set.")
 
     try:
-        # --- Call the Gemini API ---
-        response = model.generate_content(
-            prompt,
-            generation_config=GenerationConfig(
-                temperature=0.2,
-                max_output_tokens=2048
-            )
+        # --- Agent Step 1: Initialize the Tool ---
+        # Create a client to interact with the Cloud Run API.
+        print("Initializing Cloud Run client.")
+        client = run_v2.ServicesClient()
+
+        # --- Agent Step 2: Execute the Tool ---
+        # Prepare the request to list services. The 'parent' is the location to search in.
+        parent_location = f"projects/{PROJECT_ID}/locations/{LOCATION}"
+        print(f"Listing services in: {parent_location}")
+        
+        request = run_v2.ListServicesRequest(
+            parent=parent_location,
         )
+
+        # Make the API call
+        page_result = client.list_services(request=request)
+
+        # --- Agent Step 3: Format the Output ---
+        # Process the response and create a simple list of service names.
+        services_list = []
+        for service in page_result:
+            services_list.append(service.name)
         
-        agent_response = response.candidates[0].content.parts[0].text
-        print(f"Agent response: {agent_response}")
-        
-        return jsonify({"response": agent_response})
+        print(f"Found {len(services_list)} services.")
+        return jsonify({"services": services_list})
 
     except Exception as e:
-        print(f"Error calling Gemini API: {e}")
+        print(f"An unexpected error occurred: {e}")
         return jsonify({"error": str(e)}), 500

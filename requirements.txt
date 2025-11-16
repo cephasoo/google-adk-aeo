@@ -1,2 +1,3 @@
 functions-framework==3.*
 google-cloud-aiplatform==1.56.0
+google-cloud-run==0.11.0
