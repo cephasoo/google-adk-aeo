@@ -5,3 +5,4 @@ google-cloud-secret-manager==2.20.0
 google-api-python-client==2.134.0
 google-cloud-firestore==2.16.0
 requests==2.32.3
+certifi==2024.7.4
