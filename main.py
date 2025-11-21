@@ -19,6 +19,7 @@ SEARCH_ENGINE_ID = os.environ.get("SEARCH_ENGINE_ID")
 N8N_PROPOSAL_WEBHOOK_URL = os.environ.get("N8N_PROPOSAL_WEBHOOK_URL") 
 QUEUE_NAME = "story-worker-queue"
 MAX_LOOP_ITERATIONS = 2 
+
 PROPOSAL_KEYWORDS = ["outline", "draft", "proposal", "story", "brief"]
 
 STORY_WORKER_URL = f"https://{LOCATION}-{PROJECT_ID}.cloudfunctions.net/process-story-logic"
@@ -80,17 +81,22 @@ def classify_feedback_intent(feedback_text):
 def find_trending_keywords(unstructured_topic):
     global model
     print(f"Tool: find_trending_keywords for '{unstructured_topic}'")
-    extraction_prompt = f"Extract core topic/entity from: '{unstructured_topic}'. Respond ONLY with the topic."
-    extracted_topic = model.generate_content(extraction_prompt).text.strip()
+    extraction_prompt = f"""
+    The user sent this message: "{unstructured_topic}".
+    Understand their INTENT and convert it into a Google Search Query.
+    Respond with ONLY the search query string.
+    """
+    search_query = model.generate_content(extraction_prompt).text.strip()
     
     api_key = get_search_api_key()
     service = build("customsearch", "v1", developerKey=api_key)
-    q_query = f"{extracted_topic} history vs current state"
+    # Broad search to cover both history and current state
+    q_query = f"{search_query} history vs current state"
     
     res = service.cse().list(q=q_query, cx=SEARCH_ENGINE_ID, num=10).execute()
     snippets = [r.get('snippet', '') for r in res.get('items', [])]
     
-    return {"context": snippets, "clean_topic": extracted_topic}
+    return {"context": snippets, "clean_topic": search_query}
 
 def generate_comprehensive_answer(topic, context):
     global model
@@ -155,7 +161,7 @@ def start_story_workflow(request):
     intent = model.generate_content(triage_prompt).text.strip().upper()
     
     if "SOCIAL" in intent:
-        reply = model.generate_content(f"Reply wittily: '{text_input}'").text.strip()
+        reply = model.generate_content(f"Reply wittily to social msg: '{text_input}'").text.strip()
         db.collection('agent_sessions').document(session_id).set({
             "status": "completed", "type": "social", "topic": "Social", "slack_context": slack_context,
             "event_log": [{"event_type": "social", "text": text_input}]
@@ -176,7 +182,7 @@ def handle_feedback_workflow(request):
     return jsonify({"msg": "Feedback accepted"}), 202
 
 
-# --- WORKER 1: Story Logic ---
+# --- WORKER 1: Story Logic (UPDATED FOR REACTIVE KEYWORDS) ---
 @functions_framework.http
 def process_story_logic(request):
     global model, db
@@ -191,17 +197,21 @@ def process_story_logic(request):
     slack_context = req['slack_context']
 
     try:
+        # 1. Research
         research_data = find_trending_keywords(topic)
         clean_topic = research_data['clean_topic']
         
-        # Reactive Triage
+        # 2. Reactive Triage: Keyword Match
         is_proposal_request = any(w in topic.lower() for w in PROPOSAL_KEYWORDS)
-        print(f"Keyword Triage: Proposal={is_proposal_request}")
+        print(f"Keyword Triage for '{topic}': Proposal={is_proposal_request}")
 
-        event_log = [{"event_type": "user_request", "text": topic, "timestamp": str(datetime.datetime.now())}]
+        event_log = [
+            {"event_type": "user_request", "text": topic, "timestamp": str(datetime.datetime.now())},
+            {"event_type": "research", "clean_topic": clean_topic}
+        ]
         
         if not is_proposal_request:
-            # PATH A: Answer
+            # PATH A: Direct Answer
             answer_text = generate_comprehensive_answer(topic, research_data['context'])
             event_log.append({"event_type": "agent_answer", "text": answer_text})
             
@@ -251,7 +261,7 @@ def process_story_logic(request):
         print(f"Worker Error: {e}")
         return jsonify({"error": str(e)}), 500
 
-# --- WORKER 2: Feedback Logic (FINAL CORRECTED) ---
+# --- WORKER 2: Feedback Logic (CORRECTED doc_ref) ---
 @functions_framework.http
 def process_feedback_logic(request):
     global model, db
@@ -260,23 +270,26 @@ def process_feedback_logic(request):
         model = GenerativeModel(MODEL_NAME)
         db = firestore.Client()
 
-    req = request.get_json(silent=True)
-    session_id = req['session_id']
-    user_feedback = req['feedback']
+    request_json = request.get_json(silent=True)
+    session_id = request_json['session_id']
+    user_feedback = request_json['feedback']
     
+    # FIX: Define doc_ref consistently here
     doc_ref = db.collection('agent_sessions').document(session_id)
-    data = doc_ref.get().to_dict()
-    session_type = data.get('type', 'work')
-    slack_context = data.get('slack_context', {})
+    session_doc = doc_ref.get()
     
-    # 1. Conversational Handling (Social OR Previous Answer)
+    if not session_doc.exists: return jsonify({"error": "Session not found"}), 404
+    session_data = session_doc.to_dict()
+    slack_context = session_data.get('slack_context', {})
+    
+    # 1. Conversational Handling
+    session_type = session_data.get('type', 'work') 
     if session_type in ['social', 'work_answer']:
         
-        # GRADUATION CHECK
         is_graduation = any(w in user_feedback.lower() for w in PROPOSAL_KEYWORDS)
         
         if is_graduation:
-            history = data.get('event_log', [])
+            history = session_data.get('event_log', [])
             history_text = "\n".join([f"{e.get('event_type')}: {e.get('text') or e.get('message') or e.get('result')}" for e in history[-5:]])
             
             ext_prompt = f"""Extract TOPIC from history. History: {history_text}. Last Msg: "{user_feedback}". Respond ONLY with topic."""
@@ -284,14 +297,12 @@ def process_feedback_logic(request):
 
             doc_ref.update({"type": "work_proposal", "topic": derived_topic, "status": "awaiting_approval"})
             
-            # Force Proposal Mode via Prefix
             dispatch_task({
                 "session_id": session_id, "topic": f"Story Proposal: {derived_topic}", "slack_context": slack_context
             }, STORY_WORKER_URL)
             return jsonify({"msg": "Graduated"}), 200
 
-        # Normal Conversation
-        history = data.get('event_log', [])
+        history = session_data.get('event_log', [])
         context_text = "\n".join([f"{e.get('event_type')}: {e.get('text') or e.get('message')}" for e in history[-7:]])
         reply = model.generate_content(f"Reply to user in context:\n{context_text}\nUser: {user_feedback}").text.strip()
         
@@ -309,7 +320,7 @@ def process_feedback_logic(request):
 
     # PATH A: APPROVE
     if intent == "APPROVE":
-        pending_event = next((e for e in reversed(data.get('event_log', [])) if e.get('event_type') == 'adk_request_confirmation'), None)
+        pending_event = next((e for e in reversed(session_data.get('event_log', [])) if e.get('event_type') == 'adk_request_confirmation'), None)
         if not pending_event: return jsonify({"error": "No proposal"}), 500
         
         story = tell_then_and_now_story(pending_event['payload'], tool_confirmation={"confirmed": True})
@@ -322,14 +333,11 @@ def process_feedback_logic(request):
 
     # PATH B: QUESTION (Downgrade)
     elif intent == "QUESTION":
-        # Downgrade to Answer Mode
         answer_text = generate_comprehensive_answer(user_feedback, "User pivoting from proposal to question.")
-        
         doc_ref.update({
             "type": "work_answer", "status": "awaiting_feedback",
             "event_log": firestore.ArrayUnion([user_event, {"event_type": "agent_answer", "text": answer_text}])
         })
-        
         requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
             "session_id": session_id, "type": "social", "message": answer_text,
             "thread_ts": slack_context.get('ts'), "channel_id": slack_context.get('channel')
@@ -337,15 +345,14 @@ def process_feedback_logic(request):
 
     # PATH C: REFINE
     else: 
-        last_prop = next((e for e in reversed(data.get('event_log', [])) if e.get('proposal_data')), None)
+        last_prop = next((e for e in reversed(session_data.get('event_log', [])) if e.get('proposal_data')), None)
         if not last_prop: return jsonify({"error": "No proposal"}), 500
         
         try:
-            new_prop = refine_proposal(data['topic'], last_prop['proposal_data'], user_feedback)
+            new_prop = refine_proposal(session_data.get('topic'), last_prop['proposal_data'], user_feedback)
         except Exception: return jsonify({"error": "JSON failed"}), 500
 
         new_id = f"approval_{uuid.uuid4().hex[:8]}"
-        
         doc_ref.update({
             "event_log": firestore.ArrayUnion([
                 user_event, 
@@ -353,7 +360,6 @@ def process_feedback_logic(request):
                 {"event_type": "adk_request_confirmation", "approval_id": new_id, "payload": new_prop['interlinked_concepts']}
             ])
         })
-        
         requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
             "session_id": session_id, "approval_id": new_id,
             "proposal": new_prop['interlinked_concepts'],
@@ -361,55 +367,3 @@ def process_feedback_logic(request):
         })
 
     return jsonify({"msg": "done"}), 200
-
-# --- Worker 3: Knowledge Ingestion ---
-@functions_framework.http
-def ingest_knowledge(request):
-    """
-    Receives a finalized story and saves it to the permanent Knowledge Base.
-    Triggered by N8N after the Google Doc is created.
-    """
-    global db, model
-    if db is None: db = firestore.Client()
-    if model is None:
-        vertexai.init(project=PROJECT_ID, location=LOCATION)
-        model = GenerativeModel(MODEL_NAME)
-
-    request_json = request.get_json(silent=True)
-    session_id = request_json.get('session_id')
-    final_story = request_json.get('story')
-    topic = request_json.get('topic')
-    
-    if not final_story or not topic:
-        return jsonify({"error": "Missing story or topic"}), 400
-
-    print(f"Ingesting knowledge for topic: {topic}")
-
-    # 1. Generate Searchable Tags/Summary (AI Task)
-    # We ask the AI to distill the story into keywords for easier retrieval later.
-    tagging_prompt = f"""
-    Analyze this story about "{topic}".
-    Generate a list of 5-10 searchable keywords or concepts discussed in the text.
-    Also generate a 1-sentence summary.
-    Response JSON format: {{ "keywords": [], "summary": "..." }}
-    
-    STORY:
-    {final_story[:2000]}... # Truncate if too long to save tokens
-    """
-    try:
-        metadata = extract_json(model.generate_content(tagging_prompt).text)
-    except Exception:
-        metadata = {"keywords": [topic], "summary": "Story generated by agent."}
-
-    # 2. Save to Firestore 'knowledge_base' collection
-    kb_ref = db.collection('knowledge_base').document(session_id)
-    kb_ref.set({
-        "topic": topic,
-        "content": final_story,
-        "keywords": metadata['keywords'],
-        "summary": metadata['summary'],
-        "created_at": datetime.datetime.now(datetime.timezone.utc),
-        "source_session": session_id
-    })
-
-    return jsonify({"message": "Knowledge ingested successfully.", "tags": metadata['keywords']}), 200
