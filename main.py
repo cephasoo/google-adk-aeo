@@ -41,13 +41,16 @@ def get_search_api_key():
     return search_api_key
 
 def extract_json(text):
+    """Robustly extracts JSON object from text using Regex."""
     match = re.search(r'\{.*\}', text, re.DOTALL)
     if not match: raise ValueError(f"No JSON found: {text}")
     return json.loads(match.group(0))
 
 def dispatch_task(payload, target_url):
+    """Helper to send a payload to a Cloud Task Worker."""
     global tasks_client
     if tasks_client is None: tasks_client = tasks_v2.CloudTasksClient()
+    
     parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
     task = {
         "http_request": {
@@ -62,13 +65,14 @@ def dispatch_task(payload, target_url):
 
 def classify_feedback_intent(feedback_text):
     global model
+    print(f"Classifying intent: {feedback_text}")
     prompt = f"""
-    You are managing a content creation workflow. The user has sent a message regarding a proposal.
-    Classify their intent into one of three categories:
-    1. APPROVE: They like it and want to finalize/proceed.
-    2. REFINE: They want to change specific parts of the proposal.
-    3. QUESTION: They are stopping to ask a general question or discuss the topic, NOT editing the draft.
-    User Message: "{feedback_text}"
+    You are managing a content creation workflow.
+    Classify User Feedback: "{feedback_text}"
+    Classes:
+    1. APPROVE: Likes it, wants to finalize (e.g., "Looks good", "Yes").
+    2. REFINE: Wants changes (e.g., "Make it shorter").
+    3. QUESTION: Stopping to ask a general question, NOT editing (e.g., "Why did this happen?").
     Respond ONLY with: APPROVE, REFINE, or QUESTION.
     """
     response = model.generate_content(prompt).text.strip().upper()
@@ -90,13 +94,13 @@ def find_trending_keywords(unstructured_topic):
     
     api_key = get_search_api_key()
     service = build("customsearch", "v1", developerKey=api_key)
-    # Broad search to cover both history and current state
-    q_query = f"{search_query} history vs current state"
+    res_then = service.cse().list(q=f"history traditional concepts {search_query}", cx=SEARCH_ENGINE_ID, num=10).execute()
+    res_now = service.cse().list(q=f"modern trends state {search_query}", cx=SEARCH_ENGINE_ID, num=10).execute()
     
-    res = service.cse().list(q=q_query, cx=SEARCH_ENGINE_ID, num=10).execute()
-    snippets = [r.get('snippet', '') for r in res.get('items', [])]
+    snippets_then = [r.get('snippet', '') for r in res_then.get('items', [])]
+    snippets_now = [r.get('snippet', '') for r in res_now.get('items', [])]
     
-    return {"context": snippets, "clean_topic": search_query}
+    return {"context": snippets_then + snippets_now, "clean_topic": search_query}
 
 def generate_comprehensive_answer(topic, context):
     global model
@@ -131,7 +135,11 @@ def critique_proposal(topic, current_proposal):
 
 def refine_proposal(topic, current_proposal, critique):
     global model
-    prompt = f"REWRITE proposal. Topic: {topic}. Draft: {json.dumps(current_proposal)}. Critique: {critique}. Preserve keys: 'then_concept', 'now_concept', 'link'."
+    print("Tool: Refiner")
+    prompt = f"""
+    REWRITE proposal. Topic: {topic}. Draft: {json.dumps(current_proposal)}. Critique: {critique}. 
+    CRITICAL SCHEMA: Preserve exact keys: "then_concept", "now_concept", "link".
+    """
     return extract_json(model.generate_content(prompt).text)
 
 def tell_then_and_now_story(interlinked_concepts, tool_confirmation=None):
@@ -141,48 +149,129 @@ def tell_then_and_now_story(interlinked_concepts, tool_confirmation=None):
     return model.generate_content(prompt).text
 
 
-# --- DISPATCHERS ---
+# --- DISPATCHER 1: START ---
 @functions_framework.http
 def start_story_workflow(request):
     global model, db
     if model is None: 
         vertexai.init(project=PROJECT_ID, location=LOCATION)
         model = GenerativeModel(MODEL_NAME)
+    
     if db is None: db = firestore.Client()
 
     request_json = request.get_json(silent=True)
-    text_input = request_json.get('topic')
-    slack_context = { "ts": request_json.get('slack_ts'), "thread_ts": request_json.get('slack_thread_ts'), "channel": request_json.get('slack_channel') }
+    text_input = request_json.get('topic') 
+    
+    # FIX: Bundle Slack Context into a dictionary here
+    slack_context = { 
+        "ts": request_json.get('slack_ts'), 
+        "thread_ts": request_json.get('slack_thread_ts'), 
+        "channel": request_json.get('slack_channel') 
+    }
 
-    if not text_input: return jsonify({"error": "Invalid request"}), 400
-    
+    if not text_input: return jsonify({"error": "Invalid request."}), 400
+
     session_id = str(uuid.uuid4())
-    triage_prompt = f"Classify: '{text_input}'. Classes: [SOCIAL, WORK]. Respond ONLY with class name."
+
+    # Triage
+    triage_prompt = f"""
+    Classify message: "{text_input}"
+    Classes: [SOCIAL, WORK]
+    SOCIAL: Greetings, small talk, statements like "Life is good".
+    WORK: Story requests, topics, questions about specific subjects.
+    Respond ONLY with class name.
+    """
     intent = model.generate_content(triage_prompt).text.strip().upper()
-    
+    print(f"Session {session_id} Triage: {intent}")
+
     if "SOCIAL" in intent:
-        reply = model.generate_content(f"Reply wittily to social msg: '{text_input}'").text.strip()
-        db.collection('agent_sessions').document(session_id).set({
-            "status": "completed", "type": "social", "topic": "Social", "slack_context": slack_context,
-            "event_log": [{"event_type": "social", "text": text_input}]
+        social_prompt = f"""
+        User Input: "{text_input}"
+        Role: Witty, concise AI storyteller.
+        Task: Respond naturally. Then, briefly invite them to provide a topic for a "Then vs Now" story.
+        Constraints: Max 2 sentences. No lists.
+        """
+        reply = model.generate_content(social_prompt).text.strip()
+        
+        session_ref = db.collection('agent_sessions').document(session_id)
+        session_ref.set({
+            "status": "completed",
+            "type": "social",
+            "topic": "Social Interaction",
+            "slack_context": slack_context,
+            "event_log": [
+                {"event_type": "user_request", "text": text_input, "timestamp": datetime.datetime.now(datetime.timezone.utc)},
+                {"event_type": "agent_reply", "text": reply, "timestamp": datetime.datetime.now(datetime.timezone.utc)}
+            ]
         })
-        requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": reply, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts']})
-        return jsonify({"msg": "Social reply sent", "session_id": session_id}), 200
+        
+        requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+            "session_id": session_id, 
+            "type": "social",
+            "message": reply,
+            "channel_id": slack_context['channel'],
+            "thread_ts": slack_context['ts']
+        })
+        
+        return jsonify({"message": "Social reply sent.", "session_id": session_id}), 200
+
     else:
+        # WORK
+        print(f"Dispatching WORK task: {session_id}")
         db.collection('agent_sessions').document(session_id).set({
              "status": "starting", "type": "work", "topic": text_input, "slack_context": slack_context, "event_log": []
         })
-        dispatch_task({"session_id": session_id, "topic": text_input, "slack_context": slack_context}, STORY_WORKER_URL)
-        return jsonify({"type": "work", "msg": "Accepted", "session_id": session_id}), 202
+        dispatch_task({
+            "session_id": session_id, "topic": text_input, "slack_context": slack_context
+        }, STORY_WORKER_URL)
+        
+        return jsonify({"type": "work", "message": "Workflow accepted.", "session_id": session_id}), 202
 
+# --- DISPATCHER 2: FEEDBACK ---
 @functions_framework.http
 def handle_feedback_workflow(request):
     req = request.get_json(silent=True)
     dispatch_task({"session_id": req['session_id'], "feedback": req['feedback']}, FEEDBACK_WORKER_URL)
     return jsonify({"msg": "Feedback accepted"}), 202
 
+# --- Dispatcher 3: Ingest Knowledge (Long-Term Memory) ---
+@functions_framework.http
+def ingest_knowledge(request):
+    global db, model
+    if db is None: db = firestore.Client()
+    if model is None:
+        vertexai.init(project=PROJECT_ID, location=LOCATION)
+        model = GenerativeModel(MODEL_NAME)
 
-# --- WORKER 1: Story Logic (UPDATED FOR REACTIVE KEYWORDS) ---
+    request_json = request.get_json(silent=True)
+    session_id = request_json.get('session_id')
+    final_story = request_json.get('story')
+    topic = request_json.get('topic')
+    
+    if not final_story: return jsonify({"error": "Missing story"}), 400
+
+    # Generate Keywords
+    tagging_prompt = f"""
+    Analyze story about "{topic}". Generate 5-10 searchable keywords.
+    Response JSON format: {{ "keywords": ["tag1", "tag2"] }}
+    STORY: {final_story[:2000]}
+    """
+    try:
+        metadata = extract_json(model.generate_content(tagging_prompt).text)
+    except Exception:
+        metadata = {"keywords": [topic or "story"]}
+
+    # Save to Knowledge Base
+    db.collection('knowledge_base').document(session_id).set({
+        "topic": topic,
+        "content": final_story,
+        "keywords": metadata.get('keywords', []),
+        "created_at": datetime.datetime.now(datetime.timezone.utc),
+        "source_session": session_id
+    })
+    return jsonify({"msg": "Knowledge ingested."}), 200
+
+# --- WORKER 1: STORY LOGIC ---
 @functions_framework.http
 def process_story_logic(request):
     global model, db
@@ -201,7 +290,7 @@ def process_story_logic(request):
         research_data = find_trending_keywords(topic)
         clean_topic = research_data['clean_topic']
         
-        # 2. Reactive Triage: Keyword Match
+        # 2. Reactive Triage (Proposal vs Answer)
         is_proposal_request = any(w in topic.lower() for w in PROPOSAL_KEYWORDS)
         print(f"Keyword Triage for '{topic}': Proposal={is_proposal_request}")
 
@@ -261,7 +350,7 @@ def process_story_logic(request):
         print(f"Worker Error: {e}")
         return jsonify({"error": str(e)}), 500
 
-# --- WORKER 2: Feedback Logic (CORRECTED doc_ref) ---
+# --- WORKER 2: FEEDBACK LOGIC ---
 @functions_framework.http
 def process_feedback_logic(request):
     global model, db
@@ -274,67 +363,84 @@ def process_feedback_logic(request):
     session_id = request_json['session_id']
     user_feedback = request_json['feedback']
     
-    # FIX: Define doc_ref consistently here
-    doc_ref = db.collection('agent_sessions').document(session_id)
-    session_doc = doc_ref.get()
-    
+    # Standardized variable name: session_ref
+    session_ref = db.collection('agent_sessions').document(session_id)
+    session_doc = session_ref.get()
     if not session_doc.exists: return jsonify({"error": "Session not found"}), 404
     session_data = session_doc.to_dict()
     slack_context = session_data.get('slack_context', {})
-    
-    # 1. Conversational Handling
+
     session_type = session_data.get('type', 'work') 
+
     if session_type in ['social', 'work_answer']:
-        
-        is_graduation = any(w in user_feedback.lower() for w in PROPOSAL_KEYWORDS)
-        
-        if is_graduation:
-            history = session_data.get('event_log', [])
-            history_text = "\n".join([f"{e.get('event_type')}: {e.get('text') or e.get('message') or e.get('result')}" for e in history[-5:]])
-            
-            ext_prompt = f"""Extract TOPIC from history. History: {history_text}. Last Msg: "{user_feedback}". Respond ONLY with topic."""
-            derived_topic = model.generate_content(ext_prompt).text.strip()
+        # 1. Semantic Check: Is this a pivot to work?
+        transition_prompt = f"""
+        User Input: "{user_feedback}"
+        Determine if this is a request for a specific TOPIC/STORY (WORK) or just CHAT (SOCIAL).
+        Respond with JSON: {{ "intent": "SOCIAL" or "WORK", "topic": "The extracted topic if WORK, else null" }}
+        """
+        try:
+            transition_response = extract_json(model.generate_content(transition_prompt).text)
+            intent = transition_response.get("intent", "SOCIAL")
+            new_topic = transition_response.get("topic")
+        except Exception:
+            intent = "SOCIAL"
 
-            doc_ref.update({"type": "work_proposal", "topic": derived_topic, "status": "awaiting_approval"})
-            
+        # 2. Handle Graduation (Social -> Work)
+        if intent == "WORK" and new_topic:
+            print(f"Graduating Session {session_id} to WORK. Topic: {new_topic}")
+            session_ref.update({
+                "type": "work_proposal", "topic": new_topic, "status": "awaiting_approval" 
+            })
+            # Dispatch to Story Worker with "Story Proposal:" prefix to force Path B
             dispatch_task({
-                "session_id": session_id, "topic": f"Story Proposal: {derived_topic}", "slack_context": slack_context
+                "session_id": session_id, "topic": f"Story Proposal: {new_topic}", "slack_context": slack_context
             }, STORY_WORKER_URL)
-            return jsonify({"msg": "Graduated"}), 200
+            return jsonify({"message": "Session graduated to Work."}), 200
 
-        history = session_data.get('event_log', [])
-        context_text = "\n".join([f"{e.get('event_type')}: {e.get('text') or e.get('message')}" for e in history[-7:]])
-        reply = model.generate_content(f"Reply to user in context:\n{context_text}\nUser: {user_feedback}").text.strip()
-        
-        doc_ref.update({"event_log": firestore.ArrayUnion([{"event_type": "user_feedback", "text": user_feedback}, {"event_type": "agent_reply", "text": reply}])})
-        
-        requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
-            "session_id": session_id, "type": "social", "message": reply,
-            "thread_ts": slack_context.get('ts'), "channel_id": slack_context.get('channel')
-        })
-        return jsonify({"msg": "reply sent"}), 200
+        # 3. Handle Social Continuation
+        else:
+            history = session_data.get('event_log', [])
+            conversation_context = "\n".join([f"{'AI' if e.get('event_type') == 'agent_reply' else 'User'}: {e.get('text') or e.get('message')}" for e in history[-7:]])
 
-    # 2. Work Proposal Handling (The Loop)
+            chat_prompt = f"""
+            Friendly AI storyteller. Conversation: {conversation_context}. User: "{user_feedback}".
+            Task: Respond directly and briefly. No lists. No meta-commentary.
+            """
+            reply = model.generate_content(chat_prompt).text.strip()
+            
+            session_ref.update({
+                "event_log": firestore.ArrayUnion([
+                    {"event_type": "user_feedback", "text": user_feedback, "timestamp": datetime.datetime.now(datetime.timezone.utc)},
+                    {"event_type": "agent_reply", "text": reply, "timestamp": datetime.datetime.now(datetime.timezone.utc)}
+                ])
+            })
+            
+            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+                "session_id": session_id, "type": "social", "message": reply,
+                "thread_ts": slack_context.get('ts'), "channel_id": slack_context.get('channel')
+            })
+            return jsonify({"message": "Social reply processed."}), 200
+
+    # --- WORK Logic ---
     intent = classify_feedback_intent(user_feedback)
     user_event = {"event_type": "user_feedback", "text": user_feedback, "intent": intent, "timestamp": str(datetime.datetime.now())}
 
-    # PATH A: APPROVE
     if intent == "APPROVE":
         pending_event = next((e for e in reversed(session_data.get('event_log', [])) if e.get('event_type') == 'adk_request_confirmation'), None)
-        if not pending_event: return jsonify({"error": "No proposal"}), 500
+        if not pending_event: return jsonify({"error": "No proposal found."}), 500
         
         story = tell_then_and_now_story(pending_event['payload'], tool_confirmation={"confirmed": True})
         
-        doc_ref.update({"status": "completed", "final_story": story, "event_log": firestore.ArrayUnion([user_event, {"event_type": "story", "content": story}])})
+        session_ref.update({"status": "completed", "final_story": story, "event_log": firestore.ArrayUnion([user_event, {"event_type": "story", "content": story}])})
         requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
             "session_id": session_id, "proposal": [{"link": story}],
             "thread_ts": slack_context.get('ts'), "channel_id": slack_context.get('channel'), "is_final_story": True
         })
 
-    # PATH B: QUESTION (Downgrade)
     elif intent == "QUESTION":
         answer_text = generate_comprehensive_answer(user_feedback, "User pivoting from proposal to question.")
-        doc_ref.update({
+        session_ref.update({
             "type": "work_answer", "status": "awaiting_feedback",
             "event_log": firestore.ArrayUnion([user_event, {"event_type": "agent_answer", "text": answer_text}])
         })
@@ -343,17 +449,14 @@ def process_feedback_logic(request):
             "thread_ts": slack_context.get('ts'), "channel_id": slack_context.get('channel')
         })
 
-    # PATH C: REFINE
-    else: 
+    else: # REFINE
         last_prop = next((e for e in reversed(session_data.get('event_log', [])) if e.get('proposal_data')), None)
         if not last_prop: return jsonify({"error": "No proposal"}), 500
-        
         try:
             new_prop = refine_proposal(session_data.get('topic'), last_prop['proposal_data'], user_feedback)
         except Exception: return jsonify({"error": "JSON failed"}), 500
-
         new_id = f"approval_{uuid.uuid4().hex[:8]}"
-        doc_ref.update({
+        session_ref.update({
             "event_log": firestore.ArrayUnion([
                 user_event, 
                 {"event_type": "agent_proposal", "proposal_data": new_prop},
@@ -366,4 +469,4 @@ def process_feedback_logic(request):
             "thread_ts": slack_context.get('ts'), "channel_id": slack_context.get('channel')
         })
 
-    return jsonify({"msg": "done"}), 200
+    return jsonify({"message": "Feedback processed."}), 200
