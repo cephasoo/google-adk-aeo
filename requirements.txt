@@ -7,3 +7,4 @@ google-cloud-firestore==2.16.0
 requests==2.32.3
 certifi==2024.7.4
 google-cloud-tasks==2.16.3
+beautifulsoup4==4.12.3
