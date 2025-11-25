@@ -1,19 +1,6 @@
 \# The "Then \& Now" Agent: An Autonomous Content Strategist
 
-
-
 \*A Capstone Project for the 5-Day AI Agents Intensive Course with Google\*
-
-!\[Google Cloud](https://img.shields.io/badge/Google\_Cloud-4285F4?style=for-the-badge\&logo=google-cloud\&logoColor=white)
-
-!\[Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge\&logo=python\&logoColor=white)
-
-!\[N8N](https://img.shields.io/badge/n8n-1A1A1A?style=for-the-badge\&logo=n8n\&logoColor=white)
-
-!\[Slack](https://img.shields.io/badge/Slack-4A154B?style=for-the-badge\&logo=slack\&logoColor=white)
-
-!\[License](https://img.shields.io/badge/License-MIT-yellow.svg)
-
 
 
 \## 1. The Pitch
