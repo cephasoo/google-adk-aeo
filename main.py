@@ -179,12 +179,31 @@ def find_trending_keywords(unstructured_topic, history_context=""):
     return {"context": context_snippets, "clean_topic": clean_topic}
 
 def generate_comprehensive_answer(topic, context):
+    """
+    Writes a natural answer and, if useful, provides a structured summary as a JSON object.
+    This separates content generation from presentation.
+    """
     global model
     print("Tool: Answer Generator")
     prompt = f"""
-    Expert AI Assistant. User asked: "{topic}"
+    You are an expert AI assistant and a master of communication. The user asked: "{topic}"
+    
+    Use the following research context to provide a comprehensive, direct, and helpful answer in natural paragraphs.
+    Choose the BEST format for any summary, based on the content (e.g., bullet points, paragraphs, or a table).
+
+    If you choose to create a table, you MUST use clean, standard Markdown syntax.
+    
+    ---
+    EXAMPLE of a good Markdown table:
+    | Header 1 | Header 2 |
+    | :--- | :--- |
+    | Row 1, Cell 1 | Row 1, Cell 2 |
+    | Row 2, Cell 1 | Row 2, Cell 2 |
+    ---
+    
     Context: {context}
-    Task: Provide a detailed, natural answer.
+
+    Answer:
     """
     response = model.generate_content(prompt)
     return response.text.strip()
@@ -310,29 +329,45 @@ def process_story_logic(request):
     slack_context = req['slack_context']
 
     try:
-        # Robust Keyword Matching (Whole Word)
+        # 1. Reactive Triage
         is_proposal_request = any(re.search(rf"\b{w}\b", topic.lower()) for w in PROPOSAL_KEYWORDS)
-        print(f"Triage for '{topic}': Proposal={is_proposal_request}")
+        print(f"Keyword Triage for '{topic}': Proposal={is_proposal_request}")
 
+        # 2. Research
         research_data = find_trending_keywords(topic)
         clean_topic = research_data['clean_topic']
         event_log = [{"event_type": "user_request", "text": topic, "timestamp": str(datetime.datetime.now())}]
 
         if not is_proposal_request:
-            # Path A: Answer
+            # --- PATH A: Direct Answer ---
+            # The tool now returns a single Markdown string
             answer_text = generate_comprehensive_answer(topic, research_data['context'])
+            
+            # We log the raw text, letting N8N handle the parsing
             event_log.append({"event_type": "agent_answer", "text": answer_text})
+            
             db.collection('agent_sessions').document(session_id).set({
                 "status": "awaiting_feedback", "type": "work_answer", "topic": clean_topic,
                 "slack_context": slack_context, "event_log": event_log
+            }, merge=True)
+            
+            # We now send a payload that matches what the "Social" type expects in N8N
+            # N8N will parse this for a table and render it correctly.
+            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+                "session_id": session_id, 
+                "type": "social", # Tell N8N to treat this as a simple text/markdown message
+                "message": answer_text,
+                "channel_id": slack_context['channel'], 
+                "thread_ts": slack_context['ts']
             })
-            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": answer_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts']})
             return jsonify({"msg": "Answer sent"}), 200
 
         else:
-            # Path B: Proposal
+            # --- PATH B: Proposal ---
+            # This logic remains the same
             current_proposal = create_euphemistic_links(research_data)
             event_log.append({"event_type": "loop_draft", "iteration": 0, "proposal_data": current_proposal})
+
             loop_count = 0
             final_proposal = current_proposal
             while loop_count < MAX_LOOP_ITERATIONS:
@@ -346,16 +381,24 @@ def process_story_logic(request):
             
             approval_id = f"approval_{uuid.uuid4().hex[:8]}"
             event_log.append({"event_type": "adk_request_confirmation", "approval_id": approval_id, "payload": final_proposal['interlinked_concepts']})
+            
             db.collection('agent_sessions').document(session_id).set({
                 "status": "awaiting_approval", "type": "work_proposal", "topic": clean_topic,
                 "slack_context": slack_context, "event_log": event_log
+            }, merge=True)
+
+            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+                "session_id": session_id, "approval_id": approval_id,
+                "proposal": final_proposal['interlinked_concepts'],
+                "thread_ts": slack_context['ts'], "channel_id": slack_context['channel'],
+                "is_initial_post": True 
             })
-            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "approval_id": approval_id, "proposal": final_proposal['interlinked_concepts'], "thread_ts": slack_context['ts'], "channel_id": slack_context['channel'], "is_initial_post": True})
             return jsonify({"msg": "Proposal sent"}), 200
+
     except Exception as e:
+        print(f"Worker Error: {e}")
         return jsonify({"error": str(e)}), 500
 
-# --- WORKER 2: Feedback Logic (INVERTED LOGIC FIX) ---
 # --- WORKER 2: Feedback Logic (Improved Topic Extraction) ---
 @functions_framework.http
 def process_feedback_logic(request):
