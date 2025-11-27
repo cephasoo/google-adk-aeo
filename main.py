@@ -142,26 +142,47 @@ def find_trending_keywords(unstructured_topic, history_context=""):
     global model
     print(f"Tool: find_trending_keywords for input: '{unstructured_topic[:100]}...'")
     
+    # Initialize a list to hold tool execution logs
+    tool_logs = []
+    
     # 1. Prioritize URL Extraction
     url = extract_url_from_text(unstructured_topic)
     
     context_snippets = []
     clean_topic = ""
+    is_grounded = False
     
     if url:
         print(f"URL Detected: {url}. Switching to Grounding Mode.")
+        
+        # Log the attempt
+        tool_logs.append({
+            "event_type": "tool_call",
+            "tool_name": "browserless_scraper",
+            "input": url,
+            "status": "attempting",
+            "timestamp": str(datetime.datetime.now())
+        })
+        
         article_text = fetch_article_content(url)
         
-        # Format specifically for Grounding
-        context_snippets = [f"GROUNDING_SOURCE_URL: {url}", f"GROUNDING_CONTENT:\n{article_text}"]
+        # Log the result
+        status = "success" if "Error" not in article_text else "error"
+        tool_logs.append({
+            "event_type": "tool_result",
+            "tool_name": "browserless_scraper",
+            "output_summary": f"Retrieved {len(article_text)} characters",
+            "status": status,
+            "timestamp": str(datetime.datetime.now())
+        })
         
-        # Logic change: If we have a URL, the "clean_topic" should be the user's intent
-        # concerning that URL, or we let the LLM derive it later.
-        # For now, we trust the Reader Tool.
-        return {"context": context_snippets, "clean_topic": unstructured_topic, "is_grounded": True}
+        context_snippets = [f"GROUNDING_SOURCE_URL: {url}", f"GROUNDING_CONTENT:\n{article_text}"]
+        clean_topic = unstructured_topic
+        is_grounded = True
             
     else:
         print("No URL found. Using standard search mode.")
+        
         extraction_prompt = f"""
         User Input: "{unstructured_topic}"
         Previous Context: "{history_context}"
@@ -174,12 +195,26 @@ def find_trending_keywords(unstructured_topic, history_context=""):
         api_key = get_search_api_key()
         service = build("customsearch", "v1", developerKey=api_key)
         
+        # Log the search attempt
+        tool_logs.append({
+            "event_type": "tool_call",
+            "tool_name": "google_search",
+            "input": search_query,
+            "timestamp": str(datetime.datetime.now())
+        })
+        
         res = service.cse().list(q=f"{search_query}", cx=SEARCH_ENGINE_ID, num=10).execute()
         google_snippets = [r.get('snippet', '') for r in res.get('items', [])]
         context_snippets = google_snippets
         clean_topic = search_query
 
-    return {"context": context_snippets, "clean_topic": clean_topic}
+    # Return everything, including the new logs
+    return {
+        "context": context_snippets, 
+        "clean_topic": clean_topic, 
+        "is_grounded": is_grounded,
+        "tool_logs": tool_logs 
+    }
 
 def generate_comprehensive_answer(topic, context):
     global model
@@ -369,17 +404,21 @@ def process_story_logic(request):
         research_data = find_trending_keywords(topic)
         clean_topic = research_data['clean_topic']
         
-        # FIX: Define the new events as a list to append
+        # Start the Event Batch
         new_events = [{"event_type": "user_request", "text": topic, "timestamp": str(datetime.datetime.now())}]
+
+        # --- FIX: INJECT TOOL LOGS HERE ---
+        # If the tool returned logs, append them to the history
+        if "tool_logs" in research_data:
+            new_events.extend(research_data["tool_logs"])
+        # ----------------------------------
 
         if not is_proposal_request:
             # --- PATH A: Direct Answer ---
             answer_text = generate_comprehensive_answer(topic, research_data['context'])
             
-            # Add answer to the batch
             new_events.append({"event_type": "agent_answer", "text": answer_text})
             
-            # CORRECT: Uses update + ArrayUnion
             db.collection('agent_sessions').document(session_id).update({
                 "status": "awaiting_feedback", 
                 "type": "work_answer", 
@@ -416,9 +455,6 @@ def process_story_logic(request):
             approval_id = f"approval_{uuid.uuid4().hex[:8]}"
             new_events.append({"event_type": "adk_request_confirmation", "approval_id": approval_id, "payload": final_proposal['interlinked_concepts']})
             
-            # --- THE FIX WAS APPLIED HERE ---
-            # CHANGED: set(..., merge=True) -> update(...)
-            # CHANGED: event_log: new_events -> event_log: firestore.ArrayUnion(new_events)
             db.collection('agent_sessions').document(session_id).update({
                 "status": "awaiting_approval", 
                 "type": "work_proposal", 
