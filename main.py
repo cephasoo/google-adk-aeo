@@ -17,6 +17,7 @@ PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
 LOCATION = os.environ.get("GCP_LOCATION")
 MODEL_NAME = os.environ.get("MODEL_NAME")
 SEARCH_ENGINE_ID = os.environ.get("SEARCH_ENGINE_ID")
+BROWSERLESS_API_KEY = os.environ.get("BROWSERLESS_API_KEY")
 N8N_PROPOSAL_WEBHOOK_URL = os.environ.get("N8N_PROPOSAL_WEBHOOK_URL") 
 QUEUE_NAME = "story-worker-queue"
 MAX_LOOP_ITERATIONS = 2 
@@ -25,6 +26,8 @@ PROPOSAL_KEYWORDS = ["outline", "draft", "proposal", "story", "brief"]
 
 STORY_WORKER_URL = f"https://{LOCATION}-{PROJECT_ID}.cloudfunctions.net/process-story-logic"
 FEEDBACK_WORKER_URL = f"https://{LOCATION}-{PROJECT_ID}.cloudfunctions.net/process-feedback-logic"
+
+FUNCTION_IDENTITY_EMAIL = os.environ.get("FUNCTION_IDENTITY_EMAIL", f"aeo-devops-agent-identity@{PROJECT_ID}.iam.gserviceaccount.com")
 
 # --- Global Clients ---
 model = None
@@ -56,7 +59,7 @@ def dispatch_task(payload, target_url):
             "url": target_url,
             "headers": {"Content-Type": "application/json"},
             "body": json.dumps(payload).encode(),
-            "oidc_token": {"service_account_email": f"aeo-devops-agent-identity@{PROJECT_ID}.iam.gserviceaccount.com"}
+            "oidc_token": {"service_account_email": FUNCTION_IDENTITY_EMAIL}
         }
     }
     tasks_client.create_task(request={"parent": parent, "task": task})
@@ -69,64 +72,70 @@ def classify_feedback_intent(feedback_text):
     return "REFINE"
 
 def extract_url_from_text(text):
-    """Finds the first URL in a string."""
-    url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
+    """Finds and cleans the first URL in a string, handling Slack formatting."""
+    # Regex to capture http/s URLs, ignoring surrounding < > or |
+    url_pattern = r'(https?://[^\s<>|]+)'
     match = re.search(url_pattern, text)
-    return match.group(0) if match else None
+    if match:
+        return match.group(1)
+    return None
 
 
 def fetch_article_content(url):
     """
-    Uses Browserless.io to scrape content from protected sites.
+    Robustly scrapes content using Browserless REST API.
+    Fixes: Moves 'stealth' to Query Param, uses 'gotoOptions' for waiting.
     """
-    global model
     print(f"Tool: Reading URL via Browserless: {url}")
     
-    # 1. Get the secret API key
-    client = secretmanager.SecretManagerServiceClient()
-    key_name = f"projects/{PROJECT_ID}/secrets/browserless-api-key/versions/latest"
-    key_response = client.access_secret_version(name=key_name)
-    api_key = key_response.payload.data.decode("UTF-8")
+    if not BROWSERLESS_API_KEY:
+        return "Error: Browserless API Key is missing."
+
+    # FIX 1: Pass 'stealth' as a Query Parameter, not in the body
+    endpoint = f"https://production-sfo.browserless.io/content?token={BROWSERLESS_API_KEY}&stealth=true"
     
-    # 2. Construct the Browserless API call
-    browserless_url = f"https://chrome.browserless.io/content?token={api_key}"
-    
+    # FIX 2: Correct JSON Schema for /content endpoint
     payload = {
         "url": url,
-        "waitFor": 1000 # Wait 1 second for page to load JS
+        "rejectResourceTypes": ["image", "media", "font"], # Optimization: Block junk
+        "gotoOptions": {
+            "timeout": 15000, # 15s timeout
+            "waitUntil": "networkidle2" # Wait for network to settle (handles dynamic pages)
+        }
     }
     
+    headers = {
+        "Cache-Control": "no-cache", 
+        "Content-Type": "application/json"
+    }
+
     try:
-        response = requests.post(browserless_url, json=payload, timeout=30)
-        response.raise_for_status()
+        response = requests.post(endpoint, json=payload, headers=headers, timeout=20)
         
-        # 3. Use BeautifulSoup to clean the raw HTML returned by Browserless
+        if response.status_code != 200:
+            print(f"Browserless Error {response.status_code}: {response.text}")
+            return f"Failed to read content. (Status: {response.status_code})"
+
         soup = BeautifulSoup(response.content, 'html.parser')
         
-        for script in soup(["script", "style", "nav", "footer", "header"]):
-            script.extract()
-            
-        text = soup.get_text(separator=' ')
-        lines = (line.strip() for line in text.splitlines())
-        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        text = '\n'.join(chunk for chunk in chunks if chunk)
-        
-        if len(text) < 100:
-            return "Could not extract meaningful content from the page."
-        
-        # 4. Use Gemini to Summarize the scraped text (It will be noisy)
-        summary_prompt = f"""
-        This is raw text scraped from a webpage. Summarize the main points into a clean, readable article.
-        SCRAPED TEXT:
-        {text[:15000]}
-        """
-        summary = model.generate_content(summary_prompt).text.strip()
-        return summary
+        # Aggressive Cleaning
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe", "ad"]):
+            tag.decompose()
 
+        text = soup.get_text(separator='\n\n')
+        clean_text = re.sub(r'\n\s*\n', '\n\n', text).strip()
+        
+        if len(clean_text) < 200:
+            return "Content appears to be behind a login wall or empty."
+
+        return clean_text[:20000]
+
+    except requests.exceptions.Timeout:
+        return "Error: The page took too long to load."
     except Exception as e:
-        print(f"Error reading URL via Browserless: {e}")
-        return f"Failed to read the article at {url}. The site may be heavily protected."
-
+        print(f"Scraper Exception: {e}")
+        return "Error: Could not read page due to an unexpected error."
+    
 # --- AI Tools ---
 # --- UPDATED TOOL: Find Trending Keywords (URL-First Logic) ---
 def find_trending_keywords(unstructured_topic, history_context=""):
@@ -140,22 +149,16 @@ def find_trending_keywords(unstructured_topic, history_context=""):
     clean_topic = ""
     
     if url:
-        # PATH A: READ MODE
-        print(f"URL Detected: {url}. Switching to Reader Mode.")
-        
-        # Call the new Browserless function
+        print(f"URL Detected: {url}. Switching to Grounding Mode.")
         article_text = fetch_article_content(url)
         
-        context_snippets.append(f"[SOURCE ARTICLE]: {article_text}")
+        # Format specifically for Grounding
+        context_snippets = [f"GROUNDING_SOURCE_URL: {url}", f"GROUNDING_CONTENT:\n{article_text}"]
         
-        # Use LLM to extract topic FROM the summary
-        topic_extraction_prompt = f"""
-        Analyze this article summary. Identify the main topic.
-        SUMMARY: {article_text[:1000]}...
-        Respond with ONLY the topic name.
-        """
-        clean_topic = model.generate_content(topic_extraction_prompt).text.strip()
-        print(f"Extracted Topic from URL Content: {clean_topic}")
+        # Logic change: If we have a URL, the "clean_topic" should be the user's intent
+        # concerning that URL, or we let the LLM derive it later.
+        # For now, we trust the Reader Tool.
+        return {"context": context_snippets, "clean_topic": unstructured_topic, "is_grounded": True}
             
     else:
         print("No URL found. Using standard search mode.")
@@ -179,33 +182,49 @@ def find_trending_keywords(unstructured_topic, history_context=""):
     return {"context": context_snippets, "clean_topic": clean_topic}
 
 def generate_comprehensive_answer(topic, context):
-    """
-    Writes a natural answer and, if useful, provides a structured summary as a JSON object.
-    This separates content generation from presentation.
-    """
     global model
     print("Tool: Answer Generator")
+
+    # 1. Determine Mode
+    is_grounded = any("GROUNDING_CONTENT" in str(c) for c in context)
+    
+    # 2. Set Configuration Variables based on Mode
+    if is_grounded:
+        print("Mode: STRICT GROUNDING (Temp 0.0)")
+        temperature = 0.0
+        system_instruction = """
+        CRITICAL INSTRUCTION: You are in READING MODE. 
+        You have been provided with scraped content from a specific URL.
+        You MUST base your answer PRIMARILY on the provided 'GROUNDING_CONTENT'.
+        Do not hallucinate facts not present in the text.
+        If the text does not contain the answer, explicitly state that.
+        """
+    else:
+        print("Mode: RESEARCH ASSISTANT (Temp 0.7)")
+        temperature = 0.7
+        system_instruction = "You are an expert AI assistant and a master of communication. Use the research context to provide accurate answers."
+
+    # 3. Construct the Shared Prompt
+    # We inject the specific 'system_instruction' chosen above
     prompt = f"""
-    You are an expert AI assistant and a master of communication. The user asked: "{topic}"
+    {system_instruction}
     
-    Use the following research context to provide a comprehensive, direct, and helpful answer in natural paragraphs.
-    Choose the BEST format for any summary, based on the content (e.g., bullet points, paragraphs, or a table).
-
-    If you choose to create a table, you MUST use clean, standard Markdown syntax.
+    The user asked: "{topic}"
     
-    ---
-    EXAMPLE of a good Markdown table:
-    | Header 1 | Header 2 |
-    | :--- | :--- |
-    | Row 1, Cell 1 | Row 1, Cell 2 |
-    | Row 2, Cell 1 | Row 2, Cell 2 |
-    ---
+    Provide a comprehensive, direct, and helpful answer.
+    If you include a table, you MUST use clean, standard Markdown syntax.
     
-    Context: {context}
-
+    Research Context:
+    {context}
+    
     Answer:
     """
-    response = model.generate_content(prompt)
+
+    # 4. Execute Single Call
+    response = model.generate_content(
+        prompt, 
+        generation_config={"temperature": temperature}
+    )
     return response.text.strip()
 
 def create_euphemistic_links(keyword_context):
@@ -257,8 +276,21 @@ def start_story_workflow(request):
     if not text_input: return jsonify({"error": "Invalid request"}), 400
     
     session_id = str(uuid.uuid4())
-    triage_prompt = f"Classify: '{text_input}'. Classes: [SOCIAL, WORK]. Respond ONLY with class name."
-    intent = model.generate_content(triage_prompt).text.strip().upper()
+    
+    # --- FIX: DETERMINISTIC ROUTING ---
+    # Check for URL *before* asking the LLM. 
+    # If a URL is present, FORCE 'WORK' mode to trigger the Scraper.
+    has_url = extract_url_from_text(text_input) is not None
+    
+    intent = "SOCIAL" # Default
+    
+    if has_url:
+        print(f"Routing: URL detected -> Forcing WORK mode.")
+        intent = "WORK"
+    else:
+        # Fallback to LLM classification for non-URL text
+        triage_prompt = f"Classify: '{text_input}'. Classes: [SOCIAL, WORK]. Respond ONLY with class name."
+        intent = model.generate_content(triage_prompt).text.strip().upper()
     
     if "SOCIAL" in intent:
         social_prompt = f"User: '{text_input}'. Respond naturally/wittily. Max 2 sentences."
@@ -336,26 +368,29 @@ def process_story_logic(request):
         # 2. Research
         research_data = find_trending_keywords(topic)
         clean_topic = research_data['clean_topic']
-        event_log = [{"event_type": "user_request", "text": topic, "timestamp": str(datetime.datetime.now())}]
+        
+        # FIX: Define the new events as a list to append
+        new_events = [{"event_type": "user_request", "text": topic, "timestamp": str(datetime.datetime.now())}]
 
         if not is_proposal_request:
             # --- PATH A: Direct Answer ---
-            # The tool now returns a single Markdown string
             answer_text = generate_comprehensive_answer(topic, research_data['context'])
             
-            # We log the raw text, letting N8N handle the parsing
-            event_log.append({"event_type": "agent_answer", "text": answer_text})
+            # Add answer to the batch
+            new_events.append({"event_type": "agent_answer", "text": answer_text})
             
-            db.collection('agent_sessions').document(session_id).set({
-                "status": "awaiting_feedback", "type": "work_answer", "topic": clean_topic,
-                "slack_context": slack_context, "event_log": event_log
-            }, merge=True)
+            # CORRECT: Uses update + ArrayUnion
+            db.collection('agent_sessions').document(session_id).update({
+                "status": "awaiting_feedback", 
+                "type": "work_answer", 
+                "topic": clean_topic,
+                "slack_context": slack_context, 
+                "event_log": firestore.ArrayUnion(new_events)
+            })
             
-            # We now send a payload that matches what the "Social" type expects in N8N
-            # N8N will parse this for a table and render it correctly.
             requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
                 "session_id": session_id, 
-                "type": "social", # Tell N8N to treat this as a simple text/markdown message
+                "type": "social", 
                 "message": answer_text,
                 "channel_id": slack_context['channel'], 
                 "thread_ts": slack_context['ts']
@@ -364,9 +399,8 @@ def process_story_logic(request):
 
         else:
             # --- PATH B: Proposal ---
-            # This logic remains the same
             current_proposal = create_euphemistic_links(research_data)
-            event_log.append({"event_type": "loop_draft", "iteration": 0, "proposal_data": current_proposal})
+            new_events.append({"event_type": "loop_draft", "iteration": 0, "proposal_data": current_proposal})
 
             loop_count = 0
             final_proposal = current_proposal
@@ -380,12 +414,18 @@ def process_story_logic(request):
                 loop_count += 1
             
             approval_id = f"approval_{uuid.uuid4().hex[:8]}"
-            event_log.append({"event_type": "adk_request_confirmation", "approval_id": approval_id, "payload": final_proposal['interlinked_concepts']})
+            new_events.append({"event_type": "adk_request_confirmation", "approval_id": approval_id, "payload": final_proposal['interlinked_concepts']})
             
-            db.collection('agent_sessions').document(session_id).set({
-                "status": "awaiting_approval", "type": "work_proposal", "topic": clean_topic,
-                "slack_context": slack_context, "event_log": event_log
-            }, merge=True)
+            # --- THE FIX WAS APPLIED HERE ---
+            # CHANGED: set(..., merge=True) -> update(...)
+            # CHANGED: event_log: new_events -> event_log: firestore.ArrayUnion(new_events)
+            db.collection('agent_sessions').document(session_id).update({
+                "status": "awaiting_approval", 
+                "type": "work_proposal", 
+                "topic": clean_topic,
+                "slack_context": slack_context, 
+                "event_log": firestore.ArrayUnion(new_events)
+            })
 
             requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
                 "session_id": session_id, "approval_id": approval_id,
@@ -423,40 +463,57 @@ def process_feedback_logic(request):
     # 1. Conversational Handling (Social OR Previous Answer)
     if session_type in ['social', 'work_answer']:
         
+        # --- NEW: SKILL ROUTER LOGIC ---
+        # Check 1: Is this a URL/Research Request?
+        url_in_feedback = extract_url_from_text(user_feedback)
+        
+        # Check 2: Is this a "Graduation" (Proposal) Request?
         is_graduation = any(w in user_feedback.lower() for w in PROPOSAL_KEYWORDS)
         
-        if is_graduation:
-            history = session_data.get('event_log', [])
-            history_text = "\n".join([f"{e.get('event_type')}: {e.get('text') or e.get('message') or e.get('result')}" for e in history[-5:]])
+        # DECISION: Delegate to Story Worker if either is true
+        if url_in_feedback or is_graduation:
+            print(f"Delegation Triggered. URL={bool(url_in_feedback)}, Graduation={is_graduation}")
             
-            # --- THE FIX: SMARTER PROMPT ---
-            ext_prompt = f"""
-            The user wants to convert the current conversation into a formal "Then vs Now" story proposal.
+            target_topic = ""
             
-            CONVERSATION HISTORY:
-            {history_text}
-            
-            USER'S LAST COMMAND:
-            "{user_feedback}"
-            
-            TASK: Identify the SUBJECT MATTER we have been discussing (e.g., "Voice Search", "Coffee", "SEO").
-            CRITICAL: Ignore the user's command to "make a draft" or "write a story." Look at the CONTENT of the previous turns.
-            
-            Respond with ONLY the topic name.
-            """
-            derived_topic = model.generate_content(ext_prompt).text.strip()
-            print(f"Extracted Graduation Topic: {derived_topic}")
+            if url_in_feedback:
+                # Case A: URL Found -> The input IS the topic (let Story Worker scrape it)
+                target_topic = user_feedback
+                new_status = "working_on_grounding"
+                # We update type to 'work_answer' to keep it in research mode
+                doc_ref.update({"type": "work_answer", "status": new_status})
+                
+            else:
+                # Case B: Graduation -> Use LLM to extract the abstract topic
+                history = session_data.get('event_log', [])
+                history_text = "\n".join([f"{e.get('event_type')}: {e.get('text') or e.get('message') or e.get('result')}" for e in history[-5:]])
+                
+                ext_prompt = f"""
+                The user wants to convert the current conversation into a formal proposal.
+                HISTORY: {history_text}
+                USER COMMAND: "{user_feedback}"
+                Identify the SUBJECT MATTER. Ignore the command "draft this".
+                Respond with ONLY the topic name.
+                """
+                target_topic = model.generate_content(ext_prompt).text.strip()
+                doc_ref.update({"type": "work_proposal", "topic": target_topic, "status": "awaiting_approval"})
 
-            doc_ref.update({"type": "work_proposal", "topic": derived_topic, "status": "awaiting_approval"})
-            
+            # EXECUTE HANDOFF: Dispatch to the Specialist (Worker 1)
+            # We pass the same session_id so it appends to the correct history
             dispatch_task({
-                "session_id": session_id, "topic": f"Story Proposal: {derived_topic}", "slack_context": slack_context
+                "session_id": session_id, 
+                "topic": target_topic, 
+                "slack_context": slack_context
             }, STORY_WORKER_URL)
-            return jsonify({"msg": "Graduated"}), 200
+            
+            return jsonify({"msg": "Delegated to Research Worker"}), 200
 
-        # Normal Conversation
+        # --- END SKILL ROUTER ---
+
+        # Normal Conversation (No URL, No Proposal command)
         history = session_data.get('event_log', [])
         context_text = "\n".join([f"{e.get('event_type')}: {e.get('text') or e.get('message')}" for e in history[-7:]])
+        
         reply = model.generate_content(f"Reply to user in context:\n{context_text}\nUser: {user_feedback}").text.strip()
         
         doc_ref.update({"event_log": firestore.ArrayUnion([{"event_type": "user_feedback", "text": user_feedback}, {"event_type": "agent_reply", "text": reply}])})
@@ -467,7 +524,7 @@ def process_feedback_logic(request):
         })
         return jsonify({"msg": "reply sent"}), 200
 
-    # 2. Work Proposal Handling (The Loop)
+    # 2. Work Proposal Handling (The Loop) - No changes needed here
     intent = classify_feedback_intent(user_feedback)
     user_event = {"event_type": "user_feedback", "text": user_feedback, "intent": intent, "timestamp": str(datetime.datetime.now())}
 
